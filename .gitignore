@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# XcodeGen が生成するファイル (再生成可能なためコミットしない)
+AlbumToPhoto.xcodeproj/
+AlbumToPhoto.xcworkspace/
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+.swiftpm/
+
+# CocoaPods (未使用だが念のため)
+Pods/
+
+# Carthage (未使用だが念のため)
+Carthage/Build/
+
+# fastlane (未使用だが念のため)
+fastlane/report.xml
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# IDE / エディタ
+.idea/
+.vscode/
+*.swp
