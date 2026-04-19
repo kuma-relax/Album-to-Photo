@@ -1,28 +1,64 @@
 import CoreImage
+import CoreImage.CIFilterBuiltins
 import Foundation
 import UIKit
 import Vision
 
 /// アルバム 1 ページの画像から、貼り付けられている個々の写真の矩形を検出する。
 ///
-/// 内部では `VNDetectRectanglesRequest` を利用し、Vision の正規化座標 (左下原点)
-/// を UIKit 座標系 (左上原点・pt) に変換したうえで `DetectedPhoto` として返す。
+/// 内部では `VNDetectRectanglesRequest` を複数パラメータで実行（マルチパス検出）し、
+/// 前処理（コントラスト強調）で透明フィルムの反射による輪郭ボケを補うことで、
+/// 単発検出よりも取りこぼしを減らすことを狙う。
+/// Vision の正規化座標 (左下原点) は UIKit 座標系 (左上原点・pt) に変換したうえで
+/// `DetectedPhoto` として返す。
 struct PhotoDetector {
 
-    /// 検出パラメータ。チューニングしやすいように構造体として切り出しておく。
-    struct Configuration {
-        /// 写真の最小アスペクト比（短辺/長辺）。0.3 で 1:3 の縦横比まで許容。
-        var minimumAspectRatio: Float = 0.3
-        /// 写真の最小サイズ（画像短辺に対する比率）。
-        var minimumSize: Float = 0.08
-        /// 最大検出数。アルバム 1 ページは通常 2〜8 枚程度。
-        var maximumObservations = 16
-        /// 最低信頼度。
-        var minimumConfidence: VNConfidence = 0.6
-        /// 矩形統合のしきい値（IoU）。これ以上重なっていれば重複とみなす。
-        var duplicateIoUThreshold: CGFloat = 0.35
+    /// 単一の検出パスで使うパラメータ。
+    struct PassConfiguration {
+        var minimumAspectRatio: Float
+        var maximumAspectRatio: Float
+        var minimumSize: Float
+        var maximumObservations: Int
+        var minimumConfidence: VNConfidence
+        var quadratureTolerance: Float
 
-        static let `default` = Configuration()
+        /// 一般的な写真サイズ向けの標準パス。
+        static let balanced = PassConfiguration(
+            minimumAspectRatio: 0.3,
+            maximumAspectRatio: 1.0 / 0.3,
+            minimumSize: 0.05,
+            maximumObservations: 32,
+            minimumConfidence: 0.5,
+            quadratureTolerance: 45
+        )
+
+        /// 小さい写真や端のほうに寄った写真も拾うためのパス。
+        static let permissive = PassConfiguration(
+            minimumAspectRatio: 0.25,
+            maximumAspectRatio: 1.0 / 0.25,
+            minimumSize: 0.03,
+            maximumObservations: 48,
+            minimumConfidence: 0.35,
+            quadratureTolerance: 60
+        )
+    }
+
+    /// `PhotoDetector` 全体の設定。
+    struct Configuration {
+        /// 実行する検出パスのリスト。順に実行され、結果は重複除去でマージされる。
+        var passes: [PassConfiguration]
+        /// 重複除去のしきい値（IoU）。これ以上重なっていれば同一矩形とみなす。
+        var duplicateIoUThreshold: CGFloat = 0.45
+        /// コントラスト強調の前処理を有効にするかどうか。
+        var enableContrastPreprocessing: Bool = true
+        /// 前処理で用いるコントラスト倍率。1.0 で無変化。
+        var preprocessingContrast: Double = 1.2
+        /// 前処理で用いる彩度倍率（低めにして輪郭のコントラストを優先）。
+        var preprocessingSaturation: Double = 0.9
+
+        static let `default` = Configuration(
+            passes: [.balanced, .permissive]
+        )
     }
 
     enum DetectionError: Error, LocalizedError {
@@ -40,25 +76,68 @@ struct PhotoDetector {
     }
 
     var configuration: Configuration = .default
+    private let ciContext: CIContext
+
+    init(
+        configuration: Configuration = .default,
+        ciContext: CIContext = CIContext(options: [.useSoftwareRenderer: false])
+    ) {
+        self.configuration = configuration
+        self.ciContext = ciContext
+    }
+
+    // MARK: - Public API
 
     /// 指定画像から写真矩形を検出する。
     /// - Parameter image: `imageOrientation` が `.up` に正規化された `UIImage` を想定。
     /// - Returns: 検出された `DetectedPhoto` の配列。面積の降順。
     func detect(in image: UIImage) async throws -> [DetectedPhoto] {
-        guard let cgImage = image.cgImage else {
+        guard let originalCGImage = image.cgImage else {
             throw DetectionError.missingCGImage
         }
 
+        let imageSize = CGSize(width: originalCGImage.width, height: originalCGImage.height)
+
+        // 前処理 (コントラスト強調)。Vision に渡すのは前処理後の CGImage。
+        let processedCGImage: CGImage = {
+            guard configuration.enableContrastPreprocessing else { return originalCGImage }
+            return preprocessedCGImage(from: originalCGImage) ?? originalCGImage
+        }()
+
+        var allDetections: [DetectedPhoto] = []
+        for pass in configuration.passes {
+            let detections = try runPass(
+                pass,
+                cgImage: processedCGImage,
+                imageSize: imageSize
+            )
+            allDetections.append(contentsOf: detections)
+        }
+
+        let deduplicated = Self.deduplicate(
+            detections: allDetections,
+            iouThreshold: configuration.duplicateIoUThreshold
+        )
+
+        return deduplicated.sorted { $0.quad.area > $1.quad.area }
+    }
+
+    // MARK: - Single pass
+
+    private func runPass(
+        _ pass: PassConfiguration,
+        cgImage: CGImage,
+        imageSize: CGSize
+    ) throws -> [DetectedPhoto] {
         let request = VNDetectRectanglesRequest()
-        request.minimumAspectRatio = configuration.minimumAspectRatio
-        request.maximumAspectRatio = 1.0 / configuration.minimumAspectRatio
-        request.minimumSize = configuration.minimumSize
-        request.maximumObservations = configuration.maximumObservations
-        request.minimumConfidence = configuration.minimumConfidence
-        request.quadratureTolerance = 20
+        request.minimumAspectRatio = pass.minimumAspectRatio
+        request.maximumAspectRatio = pass.maximumAspectRatio
+        request.minimumSize = pass.minimumSize
+        request.maximumObservations = pass.maximumObservations
+        request.minimumConfidence = pass.minimumConfidence
+        request.quadratureTolerance = pass.quadratureTolerance
 
         let handler = VNImageRequestHandler(cgImage: cgImage, orientation: .up, options: [:])
-
         do {
             try handler.perform([request])
         } catch {
@@ -66,20 +145,27 @@ struct PhotoDetector {
         }
 
         let observations = request.results ?? []
-        let imageSize = CGSize(width: cgImage.width, height: cgImage.height)
-
-        let converted = observations.map { observation -> DetectedPhoto in
+        return observations.map { observation in
             let quad = Self.quadrilateral(from: observation, imageSize: imageSize)
             return DetectedPhoto(quad: quad, confidence: observation.confidence)
         }
+    }
 
-        let deduplicated = Self.deduplicate(
-            detections: converted,
-            iouThreshold: configuration.duplicateIoUThreshold
-        )
+    // MARK: - Preprocessing
 
-        // 面積の降順でソート
-        return deduplicated.sorted { $0.quad.area > $1.quad.area }
+    /// 透明フィルムの反射や退色で輪郭がボケた写真でも Vision が検出しやすいよう、
+    /// コントラストを少し上げた CGImage を作って返す。
+    private func preprocessedCGImage(from cgImage: CGImage) -> CGImage? {
+        let ciImage = CIImage(cgImage: cgImage)
+
+        let filter = CIFilter.colorControls()
+        filter.inputImage = ciImage
+        filter.contrast = Float(configuration.preprocessingContrast)
+        filter.saturation = Float(configuration.preprocessingSaturation)
+        filter.brightness = 0
+
+        guard let output = filter.outputImage else { return nil }
+        return ciContext.createCGImage(output, from: output.extent)
     }
 
     // MARK: - Helpers
@@ -108,7 +194,6 @@ struct PhotoDetector {
         detections: [DetectedPhoto],
         iouThreshold: CGFloat
     ) -> [DetectedPhoto] {
-        // 信頼度の降順にソートし、既に採用済みの矩形と IoU がしきい値を超えるものを捨てる。
         let sorted = detections.sorted { $0.confidence > $1.confidence }
         var kept: [DetectedPhoto] = []
         for candidate in sorted {
