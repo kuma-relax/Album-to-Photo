@@ -28,4 +28,16 @@ extension CGRect {
         guard unionArea > 0 else { return 0 }
         return (intersection.width * intersection.height) / unionArea
     }
+
+    /// `self` が `other` にどれだけ含まれているかの割合 (0.0〜1.0)。
+    /// `intersection(self, other) / area(self)` を返す。
+    /// `self` が `other` の内側に完全に収まっている場合 1.0、接点が無ければ 0.0。
+    /// 面積 0 の矩形については 0 を返す。
+    func containmentRatio(inside other: CGRect) -> CGFloat {
+        let selfArea = width * height
+        guard selfArea > 0 else { return 0 }
+        let intersection = self.intersection(other)
+        if intersection.isNull || intersection.isEmpty { return 0 }
+        return (intersection.width * intersection.height) / selfArea
+    }
 }
