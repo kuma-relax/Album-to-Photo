@@ -60,11 +60,84 @@ final class PhotoDetectorTests: XCTestCase {
         XCTAssertTrue(merged.contains { $0.quad.boundingBox.origin.x == 400 })
     }
 
-    /// Configuration.default が balanced + permissive の 2 パスで構成されていること。
-    func testDefaultConfigurationHasBothPasses() {
+    /// Configuration.default が単一パス + 前処理 OFF + 包含関係除去 OFF で構成されていること。
+    /// 実機検証で安定していた初期値に準じる。
+    func testDefaultConfigurationIsSinglePassConservative() {
         let config = PhotoDetector.Configuration.default
+        XCTAssertEqual(config.passes.count, 1)
+        XCTAssertFalse(config.enableContrastPreprocessing)
+        XCTAssertEqual(config.duplicateIoUThreshold, 0.35, accuracy: 0.0001)
+        XCTAssertEqual(config.containmentThreshold, 1.0, accuracy: 0.0001, "包含関係除去は無効")
+    }
+
+    /// balanced パスが初期のしきい値に戻っていること。
+    func testBalancedPassUsesInitialThresholds() {
+        let pass = PhotoDetector.PassConfiguration.balanced
+        XCTAssertEqual(pass.minimumSize, 0.08, accuracy: 0.0001)
+        XCTAssertEqual(pass.maximumObservations, 16)
+        XCTAssertEqual(pass.minimumConfidence, 0.6, accuracy: 0.0001)
+        XCTAssertEqual(pass.quadratureTolerance, 20, accuracy: 0.0001)
+    }
+
+    /// balancedOnly が default と同じ単一パス構成なこと。
+    func testBalancedOnlyConfiguration() {
+        let config = PhotoDetector.Configuration.balancedOnly
+        XCTAssertEqual(config.passes.count, 1)
+        XCTAssertFalse(config.enableContrastPreprocessing)
+    }
+
+    /// multiPass が 2 パス + 前処理 + 包含除去有効になっていること。
+    func testMultiPassConfiguration() {
+        let config = PhotoDetector.Configuration.multiPass
         XCTAssertEqual(config.passes.count, 2)
         XCTAssertTrue(config.enableContrastPreprocessing)
         XCTAssertEqual(config.duplicateIoUThreshold, 0.45, accuracy: 0.0001)
+        XCTAssertLessThan(config.containmentThreshold, 1.0, "包含除去が有効")
+    }
+
+    /// 大きい矩形の内部に収まった小さい矩形が、包含関係ベースの重複除去で落とされること。
+    /// `multiPass` が依存している挙動なので引き続き検証する。
+    func testDeduplicateRemovesInnerRectContainedInLargerRect() {
+        let bigRect = CGRect(x: 0, y: 0, width: 400, height: 300)
+        let faceRect = CGRect(x: 50, y: 50, width: 80, height: 80)
+        let disjointRect = CGRect(x: 600, y: 600, width: 200, height: 150)
+
+        let detections = [
+            DetectedPhoto(quad: Quadrilateral(rect: bigRect), confidence: 0.9),
+            DetectedPhoto(quad: Quadrilateral(rect: faceRect), confidence: 0.75),
+            DetectedPhoto(quad: Quadrilateral(rect: disjointRect), confidence: 0.85)
+        ]
+
+        let result = PhotoDetector.deduplicate(
+            detections: detections,
+            iouThreshold: 0.45,
+            containmentThreshold: 0.8,
+            containmentAreaRatio: 1.5
+        )
+
+        XCTAssertEqual(result.count, 2)
+        XCTAssertTrue(result.contains(where: { $0.quad.boundingBox == bigRect }))
+        XCTAssertTrue(result.contains(where: { $0.quad.boundingBox == disjointRect }))
+        XCTAssertFalse(result.contains(where: { $0.quad.boundingBox == faceRect }))
+    }
+
+    /// `containmentThreshold = 1.0` で包含関係ロジックが無効化されること。
+    func testDeduplicateDisablesContainmentWhenThresholdIsOne() {
+        let bigRect = CGRect(x: 0, y: 0, width: 400, height: 300)
+        let faceRect = CGRect(x: 50, y: 50, width: 80, height: 80)
+
+        let detections = [
+            DetectedPhoto(quad: Quadrilateral(rect: bigRect), confidence: 0.9),
+            DetectedPhoto(quad: Quadrilateral(rect: faceRect), confidence: 0.75)
+        ]
+
+        let result = PhotoDetector.deduplicate(
+            detections: detections,
+            iouThreshold: 0.45,
+            containmentThreshold: 1.0,
+            containmentAreaRatio: 1.5
+        )
+
+        XCTAssertEqual(result.count, 2)
     }
 }
