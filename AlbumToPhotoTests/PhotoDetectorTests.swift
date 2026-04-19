@@ -121,6 +121,29 @@ final class PhotoDetectorTests: XCTestCase {
         XCTAssertFalse(result.contains(where: { $0.quad.boundingBox == faceRect }))
     }
 
+    /// 面積 0 の矩形は包含関係チェックで黙って落とされず、そのまま残ること。
+    /// (Devin Review 指摘: 以前は guard で continue していたため silently dropped)
+    func testDeduplicateKeepsZeroAreaDetectionsWhenContainmentEnabled() {
+        let zeroAreaRect = CGRect(x: 100, y: 100, width: 0, height: 0)
+        let normalRect = CGRect(x: 0, y: 0, width: 200, height: 150)
+
+        let detections = [
+            DetectedPhoto(quad: Quadrilateral(rect: normalRect), confidence: 0.9),
+            DetectedPhoto(quad: Quadrilateral(rect: zeroAreaRect), confidence: 0.8)
+        ]
+
+        let result = PhotoDetector.deduplicate(
+            detections: detections,
+            iouThreshold: 0.45,
+            containmentThreshold: 0.8,
+            containmentAreaRatio: 1.5
+        )
+
+        XCTAssertEqual(result.count, 2, "面積 0 の矩形も残す")
+        XCTAssertTrue(result.contains(where: { $0.quad.boundingBox == normalRect }))
+        XCTAssertTrue(result.contains(where: { $0.quad.area == 0 }))
+    }
+
     /// `containmentThreshold = 1.0` で包含関係ロジックが無効化されること。
     func testDeduplicateDisablesContainmentWhenThresholdIsOne() {
         let bigRect = CGRect(x: 0, y: 0, width: 400, height: 300)

@@ -266,7 +266,12 @@ struct PhotoDetector {
         var survivors: [DetectedPhoto] = []
         for (index, candidate) in kept.enumerated() {
             let candidateArea = candidate.quad.area
-            guard candidateArea > 0 else { continue }
+            // 面積 0 の矩形は「何かに含まれている」と判定できないため、包含関係
+            // チェックをスキップしてそのまま残す (黙って落とさない)。
+            guard candidateArea > 0 else {
+                survivors.append(candidate)
+                continue
+            }
             let candidateBox = candidate.quad.boundingBox
             let isInsideLarger = kept.enumerated().contains { otherIndex, other in
                 guard otherIndex != index else { return false }
