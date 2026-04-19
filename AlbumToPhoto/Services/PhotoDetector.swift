@@ -6,9 +6,10 @@ import Vision
 
 /// アルバム 1 ページの画像から、貼り付けられている個々の写真の矩形を検出する。
 ///
-/// 内部では `VNDetectRectanglesRequest` を複数パラメータで実行（マルチパス検出）し、
-/// 前処理（コントラスト強調）で透明フィルムの反射による輪郭ボケを補うことで、
-/// 単発検出よりも取りこぼしを減らすことを狙う。
+/// デフォルトでは `VNDetectRectanglesRequest` を単一パスで実行する。この設定は
+/// 実機検証で「誤検出が少なく安定している」とのフィードバックが得られた組み合わせ。
+/// さらに取りこぼしを減らしたい場合は `Configuration.multiPass` を渡すことで
+/// コントラスト前処理・マルチパス検出・包含関係ベースの重複除去を有効化できる。
 /// Vision の正規化座標 (左下原点) は UIKit 座標系 (左上原点・pt) に変換したうえで
 /// `DetectedPhoto` として返す。
 struct PhotoDetector {
@@ -22,42 +23,67 @@ struct PhotoDetector {
         var minimumConfidence: VNConfidence
         var quadratureTolerance: Float
 
-        /// 一般的な写真サイズ向けの標準パス。
+        /// 標準パス。実機検証で安定していた初期の設定値。
         static let balanced = PassConfiguration(
             minimumAspectRatio: 0.3,
             maximumAspectRatio: 1.0 / 0.3,
-            minimumSize: 0.05,
-            maximumObservations: 32,
-            minimumConfidence: 0.5,
-            quadratureTolerance: 45
+            minimumSize: 0.08,
+            maximumObservations: 16,
+            minimumConfidence: 0.6,
+            quadratureTolerance: 20
         )
 
         /// 小さい写真や端のほうに寄った写真も拾うためのパス。
+        /// 単体で使うと写真内部まで矩形として拾ってしまうことがあるため、
+        /// `Configuration.multiPass` と包含関係ベースの重複除去と組み合わせて使うこと。
         static let permissive = PassConfiguration(
             minimumAspectRatio: 0.25,
             maximumAspectRatio: 1.0 / 0.25,
-            minimumSize: 0.03,
-            maximumObservations: 48,
-            minimumConfidence: 0.35,
-            quadratureTolerance: 60
+            minimumSize: 0.05,
+            maximumObservations: 32,
+            minimumConfidence: 0.48,
+            quadratureTolerance: 45
         )
     }
 
     /// `PhotoDetector` 全体の設定。
     struct Configuration {
         /// 実行する検出パスのリスト。順に実行され、結果は重複除去でマージされる。
-        var passes: [PassConfiguration]
+        var passes: [PassConfiguration] = [.balanced]
         /// 重複除去のしきい値（IoU）。これ以上重なっていれば同一矩形とみなす。
-        var duplicateIoUThreshold: CGFloat = 0.45
+        var duplicateIoUThreshold: CGFloat = 0.35
+        /// 包含関係に基づく重複除去のしきい値。小さい矩形が大きい矩形に
+        /// この割合以上含まれている場合、写真内部の誤検出とみなして除去する。
+        /// 1.0 に設定するとこのロジックは無効化される（デフォルト）。
+        var containmentThreshold: CGFloat = 1.0
+        /// 包含関係による除去を行う際、2 つの矩形の面積比がこれ以上離れている
+        /// 場合のみ除去対象にする。誤って同程度のサイズの写真を潰さないため。
+        var containmentAreaRatio: CGFloat = 1.5
         /// コントラスト強調の前処理を有効にするかどうか。
-        var enableContrastPreprocessing: Bool = true
+        var enableContrastPreprocessing: Bool = false
         /// 前処理で用いるコントラスト倍率。1.0 で無変化。
-        var preprocessingContrast: Double = 1.2
+        /// 強めると輪郭は立つが、写真内部のエッジまで強調されて誤検出の原因になる。
+        var preprocessingContrast: Double = 1.1
         /// 前処理で用いる彩度倍率（低めにして輪郭のコントラストを優先）。
         var preprocessingSaturation: Double = 0.9
 
-        static let `default` = Configuration(
-            passes: [.balanced, .permissive]
+        /// 標準構成: 単一 `balanced` パス + 前処理なし + 包含除去なし。
+        /// 実機検証で安定していた初期の挙動。
+        static let `default` = Configuration()
+
+        /// `default` と同一構成。呼び出し側での意図を明示したい場合に使う。
+        static let balancedOnly = Configuration()
+
+        /// 取りこぼしを抑えるマルチパス構成。代わりに誤検出がやや増える傾向がある。
+        /// `balanced` + `permissive` の 2 パス + コントラスト前処理 + 包含関係除去。
+        static let multiPass = Configuration(
+            passes: [.balanced, .permissive],
+            duplicateIoUThreshold: 0.45,
+            containmentThreshold: 0.8,
+            containmentAreaRatio: 1.5,
+            enableContrastPreprocessing: true,
+            preprocessingContrast: 1.1,
+            preprocessingSaturation: 0.9
         )
     }
 
@@ -116,7 +142,9 @@ struct PhotoDetector {
 
         let deduplicated = Self.deduplicate(
             detections: allDetections,
-            iouThreshold: configuration.duplicateIoUThreshold
+            iouThreshold: configuration.duplicateIoUThreshold,
+            containmentThreshold: configuration.containmentThreshold,
+            containmentAreaRatio: configuration.containmentAreaRatio
         )
 
         return deduplicated.sorted { $0.quad.area > $1.quad.area }
@@ -155,6 +183,7 @@ struct PhotoDetector {
 
     /// 透明フィルムの反射や退色で輪郭がボケた写真でも Vision が検出しやすいよう、
     /// コントラストを少し上げた CGImage を作って返す。
+    /// `Configuration.multiPass` など前処理を有効化した場合のみ呼ばれる。
     private func preprocessedCGImage(from cgImage: CGImage) -> CGImage? {
         let ciImage = CIImage(cgImage: cgImage)
 
@@ -190,10 +219,35 @@ struct PhotoDetector {
     }
 
     /// IoU による重複除去。同じ領域を指している矩形のうち、信頼度が高い方を残す。
+    /// 後方互換のため残している。
     static func deduplicate(
         detections: [DetectedPhoto],
         iouThreshold: CGFloat
     ) -> [DetectedPhoto] {
+        deduplicate(
+            detections: detections,
+            iouThreshold: iouThreshold,
+            containmentThreshold: 1.0,
+            containmentAreaRatio: 1.0
+        )
+    }
+
+    /// IoU + 包含関係による重複除去。
+    /// - Parameters:
+    ///   - iouThreshold: 2 つの矩形を同一とみなす IoU のしきい値。
+    ///   - containmentThreshold: 小さい矩形が大きい矩形に含まれる割合のしきい値。
+    ///     例えば 0.8 なら、小さい矩形が大きい矩形の 80% 以上に収まっていれば
+    ///     写真内部の誤検出として除去する。 1.0 を指定すると無効化される。
+    ///   - containmentAreaRatio: 包含関係を使って除去する際の面積比しきい値。
+    ///     大きい矩形の面積がこの倍以上でなければ除去しない（同サイズに近い矩形
+    ///     同士を潰さないガード）。
+    static func deduplicate(
+        detections: [DetectedPhoto],
+        iouThreshold: CGFloat,
+        containmentThreshold: CGFloat,
+        containmentAreaRatio: CGFloat
+    ) -> [DetectedPhoto] {
+        // 信頼度の高い順に採用していく従来の IoU ベース重複除去。
         let sorted = detections.sorted { $0.confidence > $1.confidence }
         var kept: [DetectedPhoto] = []
         for candidate in sorted {
@@ -205,6 +259,32 @@ struct PhotoDetector {
                 kept.append(candidate)
             }
         }
-        return kept
+
+        // 包含関係ベースの除去。小さい矩形が大きい矩形に含まれているなら削除する。
+        // 信頼度の順序は保ったまま "大きい方" を残したいので、面積で比較する。
+        guard containmentThreshold < 1.0 else { return kept }
+        var survivors: [DetectedPhoto] = []
+        for (index, candidate) in kept.enumerated() {
+            let candidateArea = candidate.quad.area
+            // 面積 0 の矩形は「何かに含まれている」と判定できないため、包含関係
+            // チェックをスキップしてそのまま残す (黙って落とさない)。
+            guard candidateArea > 0 else {
+                survivors.append(candidate)
+                continue
+            }
+            let candidateBox = candidate.quad.boundingBox
+            let isInsideLarger = kept.enumerated().contains { otherIndex, other in
+                guard otherIndex != index else { return false }
+                let otherArea = other.quad.area
+                guard otherArea > 0 else { return false }
+                // candidate が other より大きい、または同程度のサイズなら除去対象外。
+                guard otherArea >= candidateArea * containmentAreaRatio else { return false }
+                return candidateBox.containmentRatio(inside: other.quad.boundingBox) >= containmentThreshold
+            }
+            if !isInsideLarger {
+                survivors.append(candidate)
+            }
+        }
+        return survivors
     }
 }
